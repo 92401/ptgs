@@ -41,7 +41,7 @@ class ProgressiveDataPartitioning:
         print(len(partitions))
         print(f"所有分区: {partitions}")
         # 可视化分区
-        save_partition_image(partitions,self.partition_dir)
+        save_partition_image(partitions,points,self.partition_dir)
         # 拓展分区
         distance=compute_max_xy_distance(self.train_cameras,self.pcd)
         print('扩展距离为',distance)
@@ -49,8 +49,8 @@ class ProgressiveDataPartitioning:
         expanded_partitions = expand_partitions(partitions, self.pcd,distance)
         #加入相机
         camera_in_expand_partitions = assign_cameras_to_partitions(expanded_partitions, self.train_cameras)
-        save_partition_images(camera_in_expand_partitions, self.partition_dir)
+        # save_partition_images(camera_in_expand_partitions, self.partition_dir)
         # 筛选扩展相机
         final_partitions = visibility_based_camera_selection(camera_in_expand_partitions, self.partition_visible_dir,self.pcd)
-        #save_partition_images(final_partitions,self.partition_dir)
+        save_partition_images(final_partitions,self.partition_dir)
         return final_partitions
