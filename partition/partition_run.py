@@ -5,9 +5,9 @@ import numpy as np
 from shapely.geometry.polygon import Polygon
 import open3d as o3d
 import sys
-
+from partition.plot_partition import save_partition_image,save_partition_images
 from partition.run_def import remove_outliers, tree_partition, expand_partitions, assign_cameras_to_partitions, \
-    visibility_based_camera_selection
+    visibility_based_camera_selection,compute_max_xy_distance
 
 
 class ProgressiveDataPartitioning:
@@ -40,10 +40,17 @@ class ProgressiveDataPartitioning:
         partitions = tree_partition(points3d, bounds, self.threshold)
         print(len(partitions))
         print(f"所有分区: {partitions}")
+        # 可视化分区
+        save_partition_image(partitions,self.partition_dir)
         # 拓展分区
-        expanded_partitions = expand_partitions(partitions, self.pcd)
+        distance=compute_max_xy_distance(self.train_cameras,self.pcd)
+        print('扩展距离为',distance)
+        # breakpoint()
+        expanded_partitions = expand_partitions(partitions, self.pcd,distance)
         #加入相机
         camera_in_expand_partitions = assign_cameras_to_partitions(expanded_partitions, self.train_cameras)
+        save_partition_images(camera_in_expand_partitions, self.partition_dir)
         # 筛选扩展相机
         final_partitions = visibility_based_camera_selection(camera_in_expand_partitions, self.partition_visible_dir,self.pcd)
+        #save_partition_images(final_partitions,self.partition_dir)
         return final_partitions

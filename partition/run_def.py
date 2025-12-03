@@ -179,60 +179,43 @@ def tree_partition(points, bounds, threshold, depth=0):
 
 
 #-----------------计算扩展相机距离-----------------------
-def compute_avg_xz_distance(cameras, points, sample_size=10):
-    """
-    计算每个相机的在 XZ 平面上的平均距离。
+def compute_max_xy_distance(cameras, pcd, quantile=0.95, max_xy_clip=200.0):
+    points = pcd.points
+    N = len(points)
+    max_dist = 0.0
 
-    :param cameras: List[Camera]，相机对象列表
-    :param points: np.ndarray (N, 3)，所有点云的 xyz 坐标
-    :param sample_size: int，每个相机随机采样的点数
-    :return: dict，{camera_id: 平均距离}
-    """
-    continue_num=0
-    dictance=0
-    camera_distances = {}
-    for camera in cameras:
-        # 提取相机的坐标 (x, z)
-        if isinstance(camera.camera_center, torch.Tensor):
-            pose = camera.camera_center.cpu().numpy()
-        elif isinstance(camera.camera_center, np.ndarray):
-            pose = camera.camera_center
-        else:
-            pose = np.array(camera.camera_center)
-        if camera.points3D_ids is None or camera.points3D_ids.size == 0:
-            continue_num+=1
-            continue  # 如果该相机没有点，跳过
-        valid_ids_mask = camera.points3D_ids != -1
-        valid_point3D_ids = camera.points3D_ids[valid_ids_mask]
+    print("开始计算相机-点云距离（XY 平面）")
+    
+    for cam in cameras:
+        cx, cy, cz = cam.camera_center
 
-        # 检查有效的 valid_point3D_ids 是否为空
-        if valid_point3D_ids.size == 0:
-            continue_num+=1
+        visible_ids = cam.points3D_ids
+        visible_ids = visible_ids[(visible_ids >= 0) & (visible_ids < N)]
+        if len(visible_ids) == 0:
             continue
 
-        # 过滤掉超出 pcd.points 索引范围的点
-        max_index = len(points) - 1
-        visible_point_ids = valid_point3D_ids[valid_point3D_ids <= max_index]
-        camera_x, camera_z=pose[0], pose[2]  # 提取相机的平移向量 (世界坐标系)
+        visible_points = points[visible_ids]
+        M = len(visible_points)
 
+        # 采样
+        sample_num = min(300, M)  # 稍微增加采样提高统计稳定性
+        sampled = visible_points[np.random.choice(M, size=sample_num, replace=False)]
 
-        # 取出相机可见点的坐标
-        visible_points = points[visible_point_ids]  # 形状 (M, 3)
-        visible_xz = visible_points[:, [0, 2]]  # 只取 x, z 坐标
+        # XY 距离
+        sampled_xy = sampled[:, :2]
+        dist = np.linalg.norm(sampled_xy - np.array([cx, cy]), axis=1)
 
-        # 随机采样部分点（如果点数少于 sample_size，则全部取出）
-        sampled_points = visible_xz[random.sample(range(len(visible_xz)), min(sample_size, len(visible_xz)))]
+        # 去掉不合理异常点
+        dist = dist[dist < max_xy_clip]  # clip 到合理场景大小
+        if len(dist) == 0:
+            continue
 
-        # 计算这些点到相机的 xz 平面欧几里得距离
-        distances = np.linalg.norm(sampled_points - np.array([camera_x, camera_z]), axis=1)
+        # 使用分位数而不是最大值（关键）
+        robust_dist = float(np.quantile(dist, quantile))
+        max_dist = max(max_dist, robust_dist)
 
-        # 计算平均距离
-        avg_distance = np.mean(distances)
-        dictance +=avg_distance
-        # 存入结果
-        camera_distances[camera.colmap_id] = avg_distance  # 假设相机有 camera_id 作为唯一标识符
-    a=dictance / (len(cameras) - continue_num)
-    return camera_distances,a
+    return max_dist
+
 
 #-----------------扩展分区的点云和相机包围盒-----------------------
 def expand_partitions( filtered_partitions: List[Partition], point3D,

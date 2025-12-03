@@ -9,8 +9,8 @@ import sys
 from data_read.create_scene import partition, cameraList_from_camInfos_partition
 from partition.partition_run import ProgressiveDataPartitioning
 
-threshold_value =250000
-path=r"D:\download\resident\partition_00"
+threshold_value =500000
+path=r"E:\airport_data\test\ychdata"
 model_path = os.path.join(path, "model")
 
 
