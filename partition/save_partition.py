@@ -77,10 +77,10 @@ def copy_images(cameras,image_file,target_dir: str):
         image_name = camera.image_name  # 获取图片的文件名（不带后缀）
         # print(f"图片文件名: {image_name}")  # 打印文件名进行检查
         # 构建完整的源路径，假设图片是 .jpg 格式
-        source_path = os.path.join(images_path, image_name + ".jpg")
+        source_path = os.path.join(images_path, image_name + "_m.jpg")
         # print(f"构建的源路径: {source_path}")  # 打印路径进行检查
         # 构建目标图片路径
-        target_path = os.path.join(target_dir, os.path.basename(image_name) + ".jpg")
+        target_path = os.path.join(target_dir, os.path.basename(image_name) + "_m.jpg")
         # 判断源文件是否存在，避免文件不存在时发生错误
         if os.path.exists(source_path):
             shutil.copy2(source_path,target_path)  # 使用 copy2 保留文件的元数据（如修改时间等）
