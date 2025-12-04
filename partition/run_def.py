@@ -460,7 +460,59 @@ def run_graham_scan(image_points, image_width, image_height):
     # 计算intersection_rate
     image_area = image_width * image_height
     intersection_rate = area / image_area
-    return {"intersection_rate": intersection_rate}
+    return {"intersection_rate": intersection_rate,"hull": hull}
+
+import cv2
+def mask_image_by_hull(img_path, hull_points, fill_outside_with=(0, 0, 0)):
+    """
+    根据凸包点生成掩膜，将凸包外内容遮挡，并保存在原图同目录下：
+    xxx.jpg → xxx_m.jpg
+
+    参数:
+        img_path: 原始图片路径
+        hull_points: (N, 2) 凸包顶点
+        fill_outside_with: 掩膜外区域填充颜色
+    """
+
+    # 读取图片
+    img = cv2.imread(img_path)
+    if img is None:
+        raise FileNotFoundError(f"无法读取图片: {img_path}")
+
+    H, W = img.shape[:2]
+
+    # ============ 生成保存路径 ============
+    import os
+    root, ext = os.path.splitext(img_path)
+    save_path = root + "_m" + ext   # 自动变成 xxx_m.jpg
+    # =====================================
+
+    # 创建 mask
+    mask = np.zeros((H, W), dtype=np.uint8)
+
+    # 凸包转为 int32 的 polygon
+    hull = np.array(hull_points, dtype=np.int32).reshape((-1, 1, 2))
+
+    # 在 mask 上画凸包区域
+    cv2.fillPoly(mask, [hull], 255)
+
+    # 输出图像背景填色
+    output = np.zeros_like(img)
+    output[:, :] = np.array(fill_outside_with, dtype=np.uint8)
+
+    # 凸包内部保留原图
+    img_inside = cv2.bitwise_and(img, img, mask=mask)
+
+    # 合并
+    output = cv2.bitwise_and(output, output, mask=255-mask) + img_inside
+
+    # 保存结果
+    cv2.imwrite(save_path, output)
+    print(f"掩膜完成：{save_path}")
+
+    return save_path
+
+
 
 def downsample_point_cloud(pc: BasicPointCloud, voxel_size: float) -> BasicPointCloud:
     """
@@ -593,9 +645,9 @@ def process_camera_visibility(camera_pose, pcd_i, visible_rate_threshold, pcd):
 
         if pkg["intersection_rate"] >= visible_rate_threshold:
             # 相机满足可见性要求，获取可见点云
-            visible_points, visible_normals, visible_colors = process_camera(camera, pcd)
-            if visible_points is not None:
-                return camera_pose, (visible_points, visible_normals, visible_colors)
+            hull_points = pkg["hull"]
+            mask_image_by_hull(camera.image_path,  hull_points)
+            return camera_pose
 
     except Exception as e:
         print(f"处理相机 {camera.image_name} 时发生错误: {e}")
@@ -637,29 +689,17 @@ def visibility_based_camera_selection(
                 result = future.result()
                 if result[0] is not None:
                     added_cameras.append(result[0])  # 相机
-                    new_points.append(result[1][0])  # 可见点云
-                    new_colors.append(result[1][1])  # 颜色
-                    new_normals.append(result[1][2])  # 法线
 
         # 更新相机列表
         updated_partitions[idx] = updated_partitions[idx]._replace(camera=added_cameras)
 
         # 追加原始点云
         current_pcd = updated_partitions[idx].point_cloud
-        new_points.append(current_pcd.points)
-        new_colors.append(current_pcd.colors)
-        new_normals.append(current_pcd.normals)
 
-        # 合并点云数据
-        new_points = np.concatenate(new_points, axis=0)
-        new_colors = np.concatenate(new_colors, axis=0) if new_colors else None
-        new_normals = np.concatenate(new_normals, axis=0) if new_normals else None
-        new_points, mask = np.unique(new_points, return_index=True, axis=0)
-        new_colors = new_colors[mask]
-        new_normals = new_normals[mask]
-        # 更新分区
         updated_partitions[idx] = updated_partitions[idx]._replace(
-            point_cloud=BasicPointCloud(points=new_points, colors=new_colors, normals=new_normals))
+            camera=added_cameras,
+            point_cloud=current_pcd
+        )
         save_partition_as_pkl(updated_partitions[idx], plot_path)
 
         # 打印更新信息
@@ -667,7 +707,6 @@ def visibility_based_camera_selection(
         print(f"分区 {idx} 更新后的点云数量: {len(new_points)}")
         print(f"分区 {idx} 更新前的点云数量: {len(partition.point_cloud.points)}")
         print("-----------------------------")
-
     return updated_partitions
 #-----------------相机筛选完成-----------------------
 
