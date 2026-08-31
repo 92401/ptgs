@@ -61,6 +61,27 @@ def copy_cameras_to_partitions(source_path, base_partition_path):
         except Exception as e:
             print(f"Error copying file: {e}")
 
+def find_file_by_stem(directory, stem):
+    """按文件名主干（不含扩展名）在目录中查找文件，返回完整路径；找不到返回 None。"""
+    if not os.path.isdir(directory):
+        return None
+    for f in os.listdir(directory):
+        if os.path.splitext(f)[0] == stem:
+            return os.path.join(directory, f)
+    return None
+
+
+def masked_image_name(camera):
+    """生成与磁盘上掩膜图片一致的文件名（保留原扩展名，大小写一致）。"""
+    image_path = getattr(camera, "image_path", None)
+    if image_path:
+        base = os.path.basename(image_path)
+        stem, ext = os.path.splitext(base)
+        if stem == camera.image_name and ext:
+            return camera.image_name + "_m" + ext
+    return camera.image_name + "_m.jpg"
+
+
 def copy_images(cameras,image_file,target_dir: str):
     """
     复制相机对应的图片到目标文件夹。
@@ -71,22 +92,26 @@ def copy_images(cameras,image_file,target_dir: str):
     # 确保目标文件夹存在，如果不存在则创建
     if not os.path.exists(target_dir):
         os.makedirs(target_dir)
+    if not os.path.isdir(images_path):
+        print(f"警告: 源图片目录不存在: {images_path}")
+        return
+    # 一次性建立 文件名主干 -> 完整路径 的索引，避免逐相机遍历目录
+    stem_to_path = {
+        os.path.splitext(f)[0]: os.path.join(images_path, f)
+        for f in os.listdir(images_path)
+    }
     for camera_pose in cameras:
         camera = camera_pose.camera
         # 获取相机的 image_name（假设它不带后缀）
         image_name = camera.image_name  # 获取图片的文件名（不带后缀）
-        # print(f"图片文件名: {image_name}")  # 打印文件名进行检查
-        # 构建完整的源路径，假设图片是 .jpg 格式
-        source_path = os.path.join(images_path, image_name + "_m.jpg")
-        # print(f"构建的源路径: {source_path}")  # 打印路径进行检查
-        # 构建目标图片路径
-        target_path = os.path.join(target_dir, os.path.basename(image_name) + "_m.jpg")
-        # 判断源文件是否存在，避免文件不存在时发生错误
-        if os.path.exists(source_path):
+        # 按主干查找掩膜图（xxx_m.jpg / xxx_m.JPG / xxx_m.png 均可），避免扩展名大小写问题
+        source_path = stem_to_path.get(image_name + "_m")
+        if source_path is not None:
+            # 构建目标图片路径
+            target_path = os.path.join(target_dir, os.path.basename(source_path))
             shutil.copy2(source_path,target_path)  # 使用 copy2 保留文件的元数据（如修改时间等）
-            # print(f"图片 {image_name} 已成功复制到 {target_path}")
         else:
-            print(f"警告: 图片 {image_name} 在源路径 {source_path} 不存在！")
+            print(f"警告: 图片 {image_name}_m.* 在源目录 {images_path} 不存在！")
 
 def simple_camera_to_images(cameras):
     """
@@ -114,7 +139,7 @@ def simple_camera_to_images(cameras):
             qvec=qvec,
             tvec=tvec_list,
             camera_id=camera.colmap_id,
-            name=camera.image_name + '.jpg',
+            name=masked_image_name(camera),
             xys=[],  # 如果没有xys信息，可以保持为空列表
             point3D_ids=[]  # 没有3D点ID信息
         )

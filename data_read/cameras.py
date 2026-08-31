@@ -17,7 +17,8 @@ from data_read.graphics_utils import getWorld2View2, getProjectionMatrix
 
 class SimpleCamera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image_name, uid, width, height,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda", points3D_ids=None):
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda", points3D_ids=None,
+                 image_path=None):
         super(SimpleCamera, self).__init__()
         self.uid = uid
         self.colmap_id = colmap_id
@@ -28,6 +29,7 @@ class SimpleCamera(nn.Module):
         self.image_name = image_name
         self.image_width = width
         self.image_height = height
+        self.image_path = image_path  # 原图完整路径，用于生成/匹配掩膜图文件名
         self.trans = trans  # Optional translation
         self.scale = scale  # Optional scaling
         self.data_device = data_device
