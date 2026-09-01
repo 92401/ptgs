@@ -99,7 +99,7 @@ def read_points3D_text(path):
             if len(line) > 0 and line[0] != "#":
                 num_points += 1
 
-
+    ids = np.empty((num_points,), dtype=np.int64)
     xyzs = np.empty((num_points, 3))
     rgbs = np.empty((num_points, 3))
     errors = np.empty((num_points, 1))
@@ -112,15 +112,17 @@ def read_points3D_text(path):
             line = line.strip()
             if len(line) > 0 and line[0] != "#":
                 elems = line.split()
+                point3D_id = int(elems[0])
                 xyz = np.array(tuple(map(float, elems[1:4])))
                 rgb = np.array(tuple(map(int, elems[4:7])))
                 error = np.array(float(elems[7]))
+                ids[count] = point3D_id
                 xyzs[count] = xyz
                 rgbs[count] = rgb
                 errors[count] = error
                 count += 1
 
-    return xyzs, rgbs, errors
+    return ids, xyzs, rgbs, errors
 
 
 def read_extrinsics_binary_vast(path_to_model_file, lines):
@@ -203,6 +205,7 @@ def read_points3D_binary(path_to_model_file):
     with open(path_to_model_file, "rb") as fid:
         num_points = read_next_bytes(fid, 8, "Q")[0]
 
+        point3D_ids = np.empty((num_points,), dtype=np.int64)
         xyzs = np.empty((num_points, 3))
         rgbs = np.empty((num_points, 3))
         errors = np.empty((num_points, 1))
@@ -210,6 +213,7 @@ def read_points3D_binary(path_to_model_file):
         for p_id in range(num_points):
             binary_point_line_properties = read_next_bytes(
                 fid, num_bytes=43, format_char_sequence="QdddBBBd")
+            point3D_id = binary_point_line_properties[0]
             xyz = np.array(binary_point_line_properties[1:4])
             rgb = np.array(binary_point_line_properties[4:7])
             error = np.array(binary_point_line_properties[7])
@@ -218,10 +222,11 @@ def read_points3D_binary(path_to_model_file):
             track_elems = read_next_bytes(
                 fid, num_bytes=8*track_length,
                 format_char_sequence="ii"*track_length)
+            point3D_ids[p_id] = point3D_id
             xyzs[p_id] = xyz
             rgbs[p_id] = rgb
             errors[p_id] = error
-    return xyzs, rgbs, errors
+    return point3D_ids, xyzs, rgbs, errors
 
 def read_intrinsics_text(path):
     """

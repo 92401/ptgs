@@ -1,12 +1,6 @@
 import os
 import pickle
-import random
-import matplotlib.pyplot as plt
-import copy
-import time
 from shapely.geometry.geo import box
-from shapely.vectorized import contains
-from shapely.strtree import STRtree
 from shapely.geometry import Polygon, LineString,Point
 from typing import NamedTuple, List, Optional
 import math
@@ -16,7 +10,7 @@ import torch
 from data_read.cameras import SimpleCamera
 from data_read.create_scene import Partition, CameraPose
 from data_read.graphics_utils import BasicPointCloud
-from partition.save_partition import save_partition_data
+from partition.save_partition import save_partition_data, find_file_by_stem
 
 
 def remove_outliers(pcd, method="radius",
@@ -179,22 +173,38 @@ def tree_partition(points, bounds, threshold, depth=0):
 
 
 #-----------------计算扩展相机距离-----------------------
-def compute_max_xy_distance(cameras, pcd, quantile=0.95, max_xy_clip=200.0):
+def compute_max_xy_distance(cameras, pcd, point3D_ids=None, quantile=0.95, max_xy_clip=200.0):
+    """
+    计算相机到其可见点云（XY 平面）的鲁棒距离，用于确定分区扩展距离。
+
+    :param cameras: 训练相机列表（SimpleCamera）
+    :param pcd: 点云（BasicPointCloud）
+    :param point3D_ids: 与 pcd.points 行序对齐的 COLMAP 3D 点 ID 数组。
+        相机的 points3D_ids 是 COLMAP 点 ID（任意整数，不是数组下标），
+        必须通过该映射才能正确取到相机可见的点。
+    :param quantile: 距离分位数
+    :param max_xy_clip: XY 距离裁剪上限
+    """
+    if point3D_ids is None:
+        raise ValueError(
+            "compute_max_xy_distance 需要 point3D_ids："
+            "COLMAP 的 3D 点 ID 不是连续下标，必须用 ID 映射才能定位可见点")
     points = pcd.points
-    N = len(points)
     max_dist = 0.0
+    # COLMAP 3D 点 ID -> 点云行号 的显式映射
+    id_to_index = {int(pid): i for i, pid in enumerate(point3D_ids)}
 
     print("开始计算相机-点云距离（XY 平面）")
-    
+
     for cam in cameras:
         cx, cy, cz = cam.camera_center
 
         visible_ids = cam.points3D_ids
-        visible_ids = visible_ids[(visible_ids >= 0) & (visible_ids < N)]
-        if len(visible_ids) == 0:
+        indices = [id_to_index[int(pid)] for pid in visible_ids if int(pid) in id_to_index]
+        if not indices:
             continue
 
-        visible_points = points[visible_ids]
+        visible_points = points[indices]
         M = len(visible_points)
 
         # 采样
@@ -245,7 +255,7 @@ def expand_partitions( filtered_partitions: List[Partition], point3D,
     for partition in filtered_partitions:
         # 获取原始包围盒的边界
         minx, miny, maxx, maxy = partition.origin_box.bounds
-        # 计算扩展后的边界
+        # 计算扩展后的相机边界
         new_minx = minx - expansion_distance
         new_maxx = maxx + expansion_distance
         new_miny = miny - expansion_distance
@@ -266,18 +276,18 @@ def expand_partitions( filtered_partitions: List[Partition], point3D,
         point_maxx = maxx + expand_width
         point_maxy = maxy + expand_height
         # 创建扩展后的包围盒（Shapely Polygon 对象）
-        expanded_bounds = box(new_minx, new_miny, new_maxx, new_maxy)
-        pointbox=box(point_minx,point_miny,point_maxx,point_maxy)
+        expanded_bounds = box(new_minx, new_miny, new_maxx, new_maxy) #相机边界
+        pointbox=box(point_minx,point_miny,point_maxx,point_maxy)  #点云边界
         # 提取扩展后的点云数据
         filtered_basic_pcd = extract_point_cloud(point3D, pointbox)
 
         # 创建新的扩展后的分区
         expanded_partition = Partition(
             partition_id=partition.partition_id,
-            origin_box=partition.origin_box,
+            origin_box=partition.origin_box,   #高斯模型的区域，后面用来裁剪模型
             camera=[],  # 根据需要填充或保持为空
             extend_rate=expansion_distance,  # 使用固定扩展距离作为扩展率
-            extend_box=expanded_bounds,
+            extend_box=expanded_bounds,  #相机包围盒，用来确定相机总筛选范围
             point_num=len(filtered_basic_pcd.points),
             point_cloud=filtered_basic_pcd
         )
@@ -314,7 +324,7 @@ def assign_cameras_to_partitions(expanded_partitions: List[Partition], train_cam
         cameras_in_partition = []
         for camera_pose in CameraPose_list:
             # 检查相机是否在当前分区的原始边界内
-            if partition.extend_box.contains(Point((camera_pose.pose[0], camera_pose.pose[1]))):  #xz平面
+            if partition.extend_box.contains(Point((camera_pose.pose[0], camera_pose.pose[1]))):  #xY平面
                 cameras_in_partition.append(camera_pose)
         # 创建新的 Partition 实例，包含相机信息
         updated_partition = Partition(
@@ -331,9 +341,84 @@ def assign_cameras_to_partitions(expanded_partitions: List[Partition], train_cam
 
 
 #-----------------筛选相机-----------------------
-def project_points_to_camera(points, camera, device='cuda'):
+def downsample_point_cloud(pc: BasicPointCloud, voxel_size: float) -> BasicPointCloud:
     """
-    使用GPU（PyTorch）加速版的将点云投影到相机图像平面函数。
+    对点云进行体素下采样。
+    参数：
+        pc: 输入点云（BasicPointCloud）
+        voxel_size: 体素大小，越大下采样率越高（点数越少）
+
+    返回：
+        downsampled_pc: 下采样后的点云（BasicPointCloud）
+    """
+    if voxel_size <= 0:
+        raise ValueError("voxel_size must be positive.")
+
+    points = pc.points
+    colors = pc.colors
+    normals = pc.normals
+
+    # 若点数为0，直接返回
+    if len(points) == 0:
+        return pc
+
+    # 计算点云边界，用于确定体素坐标
+    min_bound = np.min(points, axis=0)
+    max_bound = np.max(points, axis=0)
+
+    # 避免除0错误和特别极端情况
+    if np.any(np.isclose(voxel_size, 0)):
+        return pc
+
+    # 将点的坐标转换为体素索引坐标（整数）
+    # voxel_idx是(N, 3)的整数数组，每个点对应所在的voxel grid坐标
+    voxel_idx = np.floor((points - min_bound) / voxel_size).astype(np.int32)
+
+    # 使用字典将点根据voxel_idx分组
+    # 字典键为3D体素坐标元组，值为对应点的index列表
+    voxel_dict = {}
+    for i, vid in enumerate(voxel_idx):
+        key = (vid[0], vid[1], vid[2])
+        if key not in voxel_dict:
+            voxel_dict[key] = []
+        voxel_dict[key].append(i)
+
+    # 对每个voxel取平均值(点坐标、颜色、法线)
+    new_points = []
+    new_colors = [] if colors is not None and len(colors) == len(points) else None
+    new_normals = [] if normals is not None and len(normals) == len(points) else None
+
+    for key, idx_list in voxel_dict.items():
+        selected_points = points[idx_list]
+        mean_point = np.mean(selected_points, axis=0)
+        new_points.append(mean_point)
+
+        if new_colors is not None:
+            mean_color = np.mean(colors[idx_list], axis=0)
+            new_colors.append(mean_color)
+
+        if new_normals is not None:
+            # 平均法线需要归一化，以免产生非单位法线
+            mean_normal = np.mean(normals[idx_list], axis=0)
+            norm_len = np.linalg.norm(mean_normal)
+            if norm_len > 1e-12:
+                mean_normal = mean_normal / norm_len
+            new_normals.append(mean_normal)
+
+    new_points = np.array(new_points, dtype=np.float32)
+    if new_colors is not None:
+        new_colors = np.array(new_colors, dtype=np.float32)
+    if new_normals is not None:
+        new_normals = np.array(new_normals, dtype=np.float32)
+
+    downsampled_pc = BasicPointCloud(points=new_points,
+                                     colors=new_colors,
+                                     normals=new_normals)
+    return downsampled_pc
+
+def project_points_to_camera(points, camera, device='cpu'):
+    """
+    使用PyTorch将点云投影到相机图像平面函数。
     参数:
         points (list或np.ndarray): 形状为 (N,3) 的3D点云。确保已是标准浮点数格式。
         camera (object): 相机对象，需包含下列属性：
@@ -343,7 +428,7 @@ def project_points_to_camera(points, camera, device='cuda'):
             - FoVy: float 垂直视场角(弧度)
             - image_width: int 图像宽度(像素)
             - image_height: int 图像高度(像素)
-        device (str): 'cuda'或'cpu'，默认为'cuda'在GPU上加速计算。
+        device (str): 'cuda'或'cpu'，默认'cpu'（无GPU环境也能运行）。
 
     返回:
         projected_points_list (list): 投影到图像平面上的2D点列表，形状为 (M, 2)。
@@ -368,7 +453,7 @@ def project_points_to_camera(points, camera, device='cuda'):
     points_camera_homog = (W2C @ points_homog.transpose(0, 1)).transpose(0, 1)  # (N,4)
     points_camera = points_camera_homog[:, :3] / points_camera_homog[:, 3, None]  # (N,3)
     # 过滤掉相机后方的点(Z>0)
-    in_front_mask = points_camera[:, 1] > 0    #要保证相机镜头朝z轴正的方向
+    in_front_mask = points_camera[:, 2] > 0    #COLMAP 相机坐标系 Z 轴朝前，用 Z>0 判断点在相机前方
     if torch.sum(in_front_mask) == 0:
         # 无点在前方
         valid_mask = torch.zeros(N, dtype=torch.bool, device=device)
@@ -460,116 +545,62 @@ def run_graham_scan(image_points, image_width, image_height):
     # 计算intersection_rate
     image_area = image_width * image_height
     intersection_rate = area / image_area
-    return {"intersection_rate": intersection_rate}
+    return {"intersection_rate": intersection_rate,"hull": hull}
 
-def downsample_point_cloud(pc: BasicPointCloud, voxel_size: float) -> BasicPointCloud:
+import cv2
+import os
+import cv2
+import numpy as np
+
+def mask_image_by_hull(image_name, hull_points, images_dir, fill_outside_with=(0, 0, 0)):
     """
-    对点云进行体素下采样。
-    参数：
-        pc: 输入点云（BasicPointCloud）
-        voxel_size: 体素大小，越大下采样率越高（点数越少）
+    根据凸包点生成掩膜，将凸包外内容遮挡，并保存在原图同目录下：
+    name.jpg → name_m.jpg（保留原扩展名，大小写与原图一致）
 
-    返回：
-        downsampled_pc: 下采样后的点云（BasicPointCloud）
+    :param image_name: 图片文件名主干（不含扩展名）
+    :param hull_points: 凸包顶点（图像像素坐标）
+    :param images_dir: 原图所在目录
+    :param fill_outside_with: 凸包外填充颜色
     """
-    if voxel_size <= 0:
-        raise ValueError("voxel_size must be positive.")
+    # 按文件名主干查找原图，避免硬编码路径和扩展名大小写问题
+    img_path = find_file_by_stem(images_dir, image_name)
+    if img_path is None:
+        raise FileNotFoundError(f"无法在 {images_dir} 中找到图片 {image_name}（任意扩展名）")
 
-    points = pc.points
-    colors = pc.colors
-    normals = pc.normals
+    img = cv2.imread(img_path)
+    if img is None:
+        raise FileNotFoundError(f"无法读取图片: {img_path}")
 
-    # 若点数为0，直接返回
-    if len(points) == 0:
-        return pc
+    H, W = img.shape[:2]
 
-    # 计算点云边界，用于确定体素坐标
-    min_bound = np.min(points, axis=0)
-    max_bound = np.max(points, axis=0)
+    # 构造保存路径：xxx.jpg → xxx_m.jpg（保留原扩展名）
+    root, ext = os.path.splitext(img_path)
+    save_path = root + "_m" + ext
 
-    # 避免除0错误和特别极端情况
-    if np.any(np.isclose(voxel_size, 0)):
-        return pc
+    # 创建 mask
+    mask = np.zeros((H, W), dtype=np.uint8)
 
-    # 将点的坐标转换为体素索引坐标（整数）
-    # voxel_idx是(N, 3)的整数数组，每个点对应所在的voxel grid坐标
-    voxel_idx = np.floor((points - min_bound) / voxel_size).astype(np.int32)
+    hull = np.array(hull_points, dtype=np.int32).reshape((-1, 1, 2))
 
-    # 使用字典将点根据voxel_idx分组
-    # 字典键为3D体素坐标元组，值为对应点的index列表
-    voxel_dict = {}
-    for i, vid in enumerate(voxel_idx):
-        key = (vid[0], vid[1], vid[2])
-        if key not in voxel_dict:
-            voxel_dict[key] = []
-        voxel_dict[key].append(i)
+    cv2.fillPoly(mask, [hull], 255)
 
-    # 对每个voxel取平均值(点坐标、颜色、法线)
-    new_points = []
-    new_colors = [] if colors is not None and len(colors) == len(points) else None
-    new_normals = [] if normals is not None and len(normals) == len(points) else None
+    # 默认输出背景色
+    output = np.zeros_like(img)
+    output[:, :] = np.array(fill_outside_with, dtype=np.uint8)
 
-    for key, idx_list in voxel_dict.items():
-        selected_points = points[idx_list]
-        mean_point = np.mean(selected_points, axis=0)
-        new_points.append(mean_point)
+    img_inside = cv2.bitwise_and(img, img, mask=mask)
 
-        if new_colors is not None:
-            mean_color = np.mean(colors[idx_list], axis=0)
-            new_colors.append(mean_color)
+    # 合并
+    output = cv2.bitwise_and(output, output, mask=255-mask) + img_inside
 
-        if new_normals is not None:
-            # 平均法线需要归一化，以免产生非单位法线
-            mean_normal = np.mean(normals[idx_list], axis=0)
-            norm_len = np.linalg.norm(mean_normal)
-            if norm_len > 1e-12:
-                mean_normal = mean_normal / norm_len
-            new_normals.append(mean_normal)
-
-    new_points = np.array(new_points, dtype=np.float32)
-    if new_colors is not None:
-        new_colors = np.array(new_colors, dtype=np.float32)
-    if new_normals is not None:
-        new_normals = np.array(new_normals, dtype=np.float32)
-
-    downsampled_pc = BasicPointCloud(points=new_points,
-                                     colors=new_colors,
-                                     normals=new_normals)
-    return downsampled_pc
+    ok = cv2.imwrite(save_path, output)
+    if not ok:
+        raise IOError(f"掩膜图写入失败: {save_path}")
+    print(f"掩膜完成：{save_path}")
 
 
 
-def process_camera(camera, pcd):
-    # 检查 points3D_ids 是否为空
-    if camera.points3D_ids is None or camera.points3D_ids.size == 0:
-        # print(f"Skipping camera with empty points3D_ids: {camera.image_name}")
-        return None, None, None
 
-    # 有效的 points3D_ids（过滤掉 -1 的无效点）
-    valid_ids_mask = camera.points3D_ids != -1
-    valid_point3D_ids = camera.points3D_ids[valid_ids_mask]
-
-    # 检查有效的 valid_point3D_ids 是否为空
-    if valid_point3D_ids.size == 0:
-        print(f"No valid points for camera: {camera.image_name}")
-        return None, None, None
-
-    # 过滤掉超出 pcd.points 索引范围的点
-    max_index = len(pcd.points) - 1
-    valid_point3D_ids = valid_point3D_ids[valid_point3D_ids <= max_index]
-
-    # 如果过滤后没有有效的点
-    if valid_point3D_ids.size == 0:
-        print(f"All points for camera {camera.image_name} are out of bounds.")
-        return None, None, None
-
-    # 使用过滤后的 valid_point3D_ids 从点云中提取对应数据
-    updated_points = pcd.points[valid_point3D_ids]
-    updated_colors = pcd.colors[valid_point3D_ids]
-    updated_normals = pcd.normals[valid_point3D_ids]
-
-
-    return updated_points, updated_colors, updated_normals
 
 
 import concurrent.futures
@@ -577,40 +608,46 @@ import copy
 from typing import List
 
 
-def process_camera_visibility(camera_pose, pcd_i, visible_rate_threshold, pcd):
+def process_camera_visibility(camera_pose, pcd_i, visible_rate_threshold, pcd, images_dir):
     """
     处理单个相机的可见性分析，并返回其可见点云和更新状态
+
+    :param images_dir: 原图所在目录，用于生成掩膜图
     """
+    # print('传入的pose类型',camera_pose)
     camera = camera_pose.camera
     try:
         # 可见性分析：将分区的点云投影到相机视图中
         image_points = project_points_to_camera(pcd_i.points, camera)
-        if len(image_points) <= 3:
-            return None, None  # 该相机不满足可见性要求
+        if len(image_points) <= 50:
+            return None  # 该相机不满足可见性要求
 
         # 使用 Graham Scan 计算可见性比率
         pkg = run_graham_scan(image_points, camera.image_width, camera.image_height)
 
         if pkg["intersection_rate"] >= visible_rate_threshold:
             # 相机满足可见性要求，获取可见点云
-            visible_points, visible_normals, visible_colors = process_camera(camera, pcd)
-            if visible_points is not None:
-                return camera_pose, (visible_points, visible_normals, visible_colors)
+            hull_points = pkg["hull"]
+            mask_image_by_hull(camera.image_name, hull_points, images_dir)
+            return camera_pose
 
     except Exception as e:
         print(f"处理相机 {camera.image_name} 时发生错误: {e}")
 
-    return None, None  # 该相机未被选择
+    return None  # 该相机未被选择
 
 
 def visibility_based_camera_selection(
         partition_list: List[Partition],
         plot_path: str,
         pcd: BasicPointCloud,
+        images_dir: str,
         max_workers: int = 48
 ) -> List[Partition]:
     """
     使用多线程处理相机可见性分析，提高处理速度
+
+    :param images_dir: 原图所在目录，用于生成掩膜图
     """
     updated_partitions = copy.deepcopy(partition_list)
 
@@ -629,45 +666,32 @@ def visibility_based_camera_selection(
         visible_rate_threshold = 0.3  # 可见性阈值
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(process_camera_visibility, camera_pose, pcd_i, visible_rate_threshold, pcd): camera_pose
+                executor.submit(process_camera_visibility, camera_pose, pcd_i, visible_rate_threshold, pcd, images_dir): camera_pose
                 for camera_pose in partition.camera
             }
 
             for future in concurrent.futures.as_completed(futures):
                 result = future.result()
-                if result[0] is not None:
-                    added_cameras.append(result[0])  # 相机
-                    new_points.append(result[1][0])  # 可见点云
-                    new_colors.append(result[1][1])  # 颜色
-                    new_normals.append(result[1][2])  # 法线
+                if result is not None:
+                    added_cameras.append(result)  # 相机（CameraPose）
 
         # 更新相机列表
         updated_partitions[idx] = updated_partitions[idx]._replace(camera=added_cameras)
 
         # 追加原始点云
         current_pcd = updated_partitions[idx].point_cloud
-        new_points.append(current_pcd.points)
-        new_colors.append(current_pcd.colors)
-        new_normals.append(current_pcd.normals)
 
-        # 合并点云数据
-        new_points = np.concatenate(new_points, axis=0)
-        new_colors = np.concatenate(new_colors, axis=0) if new_colors else None
-        new_normals = np.concatenate(new_normals, axis=0) if new_normals else None
-        new_points, mask = np.unique(new_points, return_index=True, axis=0)
-        new_colors = new_colors[mask]
-        new_normals = new_normals[mask]
-        # 更新分区
         updated_partitions[idx] = updated_partitions[idx]._replace(
-            point_cloud=BasicPointCloud(points=new_points, colors=new_colors, normals=new_normals))
+            camera=added_cameras,
+            point_cloud=current_pcd
+        )
         save_partition_as_pkl(updated_partitions[idx], plot_path)
 
         # 打印更新信息
         print(f"分区 {idx} 更新后的相机数量: {len(updated_partitions[idx].camera)}")
-        print(f"分区 {idx} 更新后的点云数量: {len(new_points)}")
+        # print(f"分区 {idx} 更新后的点云数量: {len(new_points)}")
         print(f"分区 {idx} 更新前的点云数量: {len(partition.point_cloud.points)}")
         print("-----------------------------")
-
     return updated_partitions
 #-----------------相机筛选完成-----------------------
 

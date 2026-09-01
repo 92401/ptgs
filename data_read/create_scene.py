@@ -17,6 +17,7 @@ class SceneInfo(NamedTuple):
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
+    point3D_ids: Optional[np.array] = None  # 与 point_cloud.points 行序对齐的 COLMAP 3D 点 ID
 
 class Partition(NamedTuple):
     partition_id: str  # 分区的字符编号
@@ -56,7 +57,7 @@ def readColmapCamerasPartition(cam_extrinsics, cam_intrinsics, images_folder, ma
     """
     cam_infos = []
     total_cameras = len(cam_extrinsics)
-    print(total_cameras)
+    print(total_cameras) #打印相机总数
     for idx, key in enumerate(cam_extrinsics):  # 每个相机单独处理
         sys.stdout.write('\r')
         sys.stdout.write("Reading camera {}/{}".format(idx + 1, total_cameras))
@@ -134,7 +135,8 @@ def loadCamPartition(args, id, cam_info, image_width, image_height):
     return SimpleCamera(
         colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
         FoVx=cam_info.FovX, FoVy=cam_info.FovY, image_name=cam_info.image_name,
-        uid=id, width=image_width, height=image_height, data_device=args.data_device,points3D_ids=cam_info.point3D_ids)
+        uid=id, width=image_width, height=image_height, data_device=args.data_device,
+        points3D_ids=cam_info.point3D_ids, image_path=cam_info.image_path)
 
 
 def cameraList_from_camInfos_partition(cam_infos, args):
@@ -183,7 +185,7 @@ def storePly(path, xyz, rgb):
 def partition(path, images, man_trans=None, eval=False, llffhold=83):
     # 读取整个场景的点云和相机参数，用于分块
     # 读取所有图像的信息，包括相机内外参数，以及3D点云坐标
-    print(path)
+    print(path) #colmap根路径
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")  # 相机外参文件
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")  # 相机内参文件
@@ -215,25 +217,36 @@ def partition(path, images, man_trans=None, eval=False, llffhold=83):
     ply_path = os.path.join(path, "sparse/0/points3D.ply")
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
+    # 始终读取原始 3D 点 ID（含 track 可见性），用于将相机的 point3D_ids 正确映射到点云下标
+    point3D_ids = None
+    xyz = rgb = None  #这是啥
+    try:
+        try:
+            point3D_ids, xyz, rgb, _ = read_points3D_binary(bin_path)
+        except:
+            point3D_ids, xyz, rgb, _ = read_points3D_text(txt_path)
+    except Exception as e:
+        print(f"警告: 读取 points3D 数据失败（点 ID 将不可用）: {e}")
+        point3D_ids = None
     if not os.path.exists(ply_path):
+        if xyz is None:
+            raise RuntimeError(
+                f"无法读取稀疏点云: {bin_path} 与 {txt_path} 均不可用（文件缺失或已截断）")
         print(
             "Converting point3d.bin to .ply, will happen only the first time you open the scene.")  # 将point3d.bin转换为.ply，只会在您第一次打开场景时发生。
-        try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)  #自己脚本保存ply的部分
     pcd = fetchPly(ply_path, man_trans=man_trans)  # 得到稀疏点云中，各个3D点的属性信息（坐标颜色法线），有曼哈顿的进行旋转
 
     #这部分不一定会使用
     dist_threshold = 99
     points, colors, normals = pcd.points, pcd.colors, pcd.normals
-    pcd = BasicPointCloud(points=points, colors=colors, normals=normals)  #去除离群点
+    pcd = BasicPointCloud(points=points, colors=colors, normals=normals)  #去除离群点，这里pcd对象是哪个
 
     # print(pcd)
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,   #世界坐标系下的相机几何中心
-                           ply_path=ply_path)  # 保存一个场景的所有参数信息
+                           ply_path=ply_path,
+                           point3D_ids=np.asarray(point3D_ids))  # 保存一个场景的所有参数信息
     return scene_info
