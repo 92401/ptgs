@@ -34,9 +34,15 @@
 
 ### 4. 训练演示
 
+Lichtfeld 数据集训练结果：
+
+<p align="center">
+  <img src="./assets/use_lichtfeld_train.png" alt="Lichtfeld training result" width="720">
+</p>
+
+完整训练过程 GIF（约 94 MB，超出 GitHub README 内嵌图片约 10 MB 的限制，故以链接提供）：
+
 - [查看完整训练过程 GIF](./assets/train_result.gif)
-  该 GIF 体积较大，README 中不直接内嵌。
-- [查看 Lichtfeld 数据集训练结果大图](./assets/use_lichtfeld_train.png)
 
 ---
 
